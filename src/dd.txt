@@ -1,0 +1,94 @@
+use std::collections::HashMap;
+use std::fs::{copy, create_dir_all, File};
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufRead};
+use std::path::{Path, PathBuf};
+
+struct IgnoreList {
+    patterns: Vec<String>,
+}
+
+impl IgnoreList {
+    fn from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let reader = io::BufReader::new(file);
+        let patterns = reader.lines().map(|l| l.unwrap()).collect();
+        Ok(Self { patterns })
+    }
+
+    fn should_ignore<P: AsRef<Path>>(&self, path: P) -> bool {
+        let path = path.as_ref().to_string_lossy();
+        self.patterns.iter().any(|p| path.starts_with(p))
+    }
+}
+
+fn get_sha1<P: AsRef<Path>>(path: P) -> io::Result<String> {
+    use sha1::Sha1;
+    let mut sha1 = Sha1::new();
+    let mut buffer = [0u8; 1024];
+    let mut file = File::open(path)?;
+
+    while let Ok(bytes_read) = file.read(&mut buffer) {
+        if bytes_read == 0 {
+            break;
+        }
+
+        sha1.update(&buffer[..bytes_read]);
+    }
+
+    Ok(format!("{:x}", sha1.digest()))
+}
+
+fn copy_if_needed<P1: AsRef<Path>, P2: AsRef<Path>>(src: P1, dst: P2) -> io::Result<()> {
+    if dst.as_ref().exists() {
+        let src_sha1 = get_sha1(src)?;
+        let dst_sha1 = get_sha1(dst)?;
+        if src_sha1 == dst_sha1 {
+            return Ok(());
+        }
+    }
+
+    copy(src, dst)?;
+    Ok(())
+}
+
+fn copy_dir_tree<P1: AsRef<Path>, P2: AsRef<Path>>(
+    src: P1,
+    dst: P2,
+    ignore: &IgnoreList,
+    copied_files: &mut u64,
+) -> io::Result<()> {
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+
+    for entry in src.read_dir()? {
+        let entry = entry?;
+        let path = entry.path();
+        if ignore.should_ignore(&path) {
+            continue;
+        }
+
+        if path.is_dir() {
+            create_dir_all(dst.join(path.strip_prefix(src)?))?;
+            copy_dir_tree(
+                path,
+                dst.join(path.strip_prefix(src)?),
+                ignore,
+                copied_files,
+            )?;
+        } else {
+            *copied_files += 1;
+            copy_if_needed(path, dst.join(path.strip_prefix(src)?))?;
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    let src_dir = PathBuf::from("/path/to/src");
+    let dst_dir = PathBuf::from("/path/to/dst");
+    let ignore = IgnoreList::from_file("ignore.txt").unwrap();
+    let mut copied_files = 0;
+    copy_dir_tree(src, dst, &ignore, copied_files).unwrap();
+    println!("Copied {} files", copied_files);
+}
